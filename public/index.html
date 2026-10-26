@@ -109,7 +109,7 @@
     }
 
     async function loadFaceLandmarker() {
-      setStatus("Loading face model‚Ä¶");
+      setStatus("Loading face model...");
       const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
       const options = (delegate) => ({
         baseOptions: { modelAssetPath: MODEL_URL, delegate },
@@ -191,7 +191,7 @@
       const result = faceLandmarker.detectForVideo(video, now);
       ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-      // One green dot per landmark (478 per face). Landmarks are normalized 0‚Äì1.
+      // One green dot per landmark (478 per face). Landmarks are normalized 0-1.
       const radius = Math.max(1.5, overlay.width / 640);
       ctx.fillStyle = "#00ff00";
       for (const face of result.faceLandmarks) {
