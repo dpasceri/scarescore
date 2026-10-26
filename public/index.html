@@ -67,6 +67,46 @@
     button:disabled { opacity: 0.5; cursor: default; }
 
     .status { margin: 0; color: #aaa; min-height: 1.2em; }
+
+    .meters {
+      display: grid;
+      gap: 8px;
+      padding: 14px;
+      border-radius: 12px;
+      background: #1a1a1a;
+    }
+
+    .score {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      font-weight: 600;
+    }
+
+    .score span:last-child { font-size: 2rem; color: #ff4d4d; }
+
+    .meter {
+      display: grid;
+      grid-template-columns: 7.5em 1fr 3ch;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.9rem;
+    }
+
+    .bar {
+      height: 10px;
+      border-radius: 5px;
+      background: #333;
+      overflow: hidden;
+    }
+
+    .bar div {
+      height: 100%;
+      width: 0;
+      background: #00ff00;
+    }
+
+    .meter .value { text-align: right; color: #aaa; }
   </style>
 </head>
 <body>
@@ -80,9 +120,14 @@
     <div class="controls">
       <button id="start">Start camera</button>
       <button id="stop" disabled>Stop</button>
-      <select id="cameras" aria-label="Camera"></select>
+      <select id="cameras" aria-label="Camera" hidden></select>
     </div>
     <p id="status" class="status"></p>
+
+    <section class="meters">
+      <div class="score"><span>Scare score</span><span id="score">0</span></div>
+      <div id="meters"></div>
+    </section>
   </main>
 
   <script type="module">
@@ -98,6 +143,28 @@
     const stopBtn = document.getElementById("stop");
     const cameraSelect = document.getElementById("cameras");
     const statusEl = document.getElementById("status");
+    const scoreEl = document.getElementById("score");
+    const metersEl = document.getElementById("meters");
+
+    // Scare qualities, each built from MediaPipe face blendshapes (0-1).
+    // `max` is roughly how high that blendshape goes on a big scared face,
+    // so the meter fills up instead of hovering near the bottom.
+    const QUALITIES = [
+      { label: "Mouth open", keys: ["jawOpen"], max: 0.6 },
+      { label: "Eyes wide", keys: ["eyeWideLeft", "eyeWideRight"], max: 0.5 },
+      { label: "Brows raised", keys: ["browInnerUp"], max: 0.7 },
+      { label: "Mouth stretch", keys: ["mouthStretchLeft", "mouthStretchRight"], max: 0.5 },
+    ];
+
+    for (const q of QUALITIES) {
+      const row = document.createElement("div");
+      row.className = "meter";
+      row.innerHTML = `<span>${q.label}</span><div class="bar"><div></div></div><span class="value">0</span>`;
+      metersEl.append(row);
+      q.fill = row.querySelector(".bar div");
+      q.valueEl = row.querySelector(".value");
+      q.level = 0;
+    }
 
     let stream = null;
     let rafId = null;
@@ -115,6 +182,7 @@
         baseOptions: { modelAssetPath: MODEL_URL, delegate },
         runningMode: "VIDEO",
         numFaces: 1,
+        outputFaceBlendshapes: true,
       });
       try {
         faceLandmarker = await FaceLandmarker.createFromOptions(fileset, options("GPU"));
@@ -177,6 +245,7 @@
       video.srcObject = null;
       lastVideoTime = -1;
       ctx.clearRect(0, 0, overlay.width, overlay.height);
+      updateMeters(null);
       startBtn.disabled = false;
       stopBtn.disabled = true;
     }
@@ -201,6 +270,27 @@
           ctx.fill();
         }
       }
+
+      updateMeters(result.faceBlendshapes[0]);
+    }
+
+    // `blendshapes` is MediaPipe's { categories: [{ categoryName, score }] },
+    // or null when there's no face (meters fall back to 0).
+    function updateMeters(blendshapes) {
+      const scores = {};
+      for (const c of blendshapes?.categories ?? []) scores[c.categoryName] = c.score;
+
+      let total = 0;
+      for (const q of QUALITIES) {
+        const raw = q.keys.reduce((sum, k) => sum + (scores[k] ?? 0), 0) / q.keys.length;
+        const target = Math.min(1, raw / q.max);
+        // Smooth so the bars don't jitter.
+        q.level = blendshapes ? q.level + (target - q.level) * 0.3 : 0;
+        q.fill.style.width = `${q.level * 100}%`;
+        q.valueEl.textContent = Math.round(q.level * 100);
+        total += q.level;
+      }
+      scoreEl.textContent = Math.round((total / QUALITIES.length) * 100);
     }
 
     function loop(now) {
