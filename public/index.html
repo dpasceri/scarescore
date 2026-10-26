@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Webcam Mirror</title>
+  <title>Scare Score</title>
   <style>
     :root {
       color-scheme: dark;
@@ -85,6 +85,8 @@
 
     .score span:last-child { font-size: 2rem; color: #ff4d4d; }
 
+    .score small { margin-left: 8px; font-weight: normal; color: #aaa; }
+
     .meter {
       display: grid;
       grid-template-columns: 7.5em 1fr 3ch;
@@ -118,14 +120,14 @@
     </div>
 
     <div class="controls">
-      <button id="start">Start camera</button>
+      <button id="start">Start camera + mic</button>
       <button id="stop" disabled>Stop</button>
       <select id="cameras" aria-label="Camera" hidden></select>
     </div>
     <p id="status" class="status"></p>
 
     <section class="meters">
-      <div class="score"><span>Scare score</span><span id="score">0</span></div>
+      <div class="score"><span>Scare score<small id="peak">peak 0</small></span><span id="score">0</span></div>
       <div id="meters"></div>
     </section>
   </main>
@@ -144,17 +146,22 @@
     const cameraSelect = document.getElementById("cameras");
     const statusEl = document.getElementById("status");
     const scoreEl = document.getElementById("score");
+    const peakEl = document.getElementById("peak");
     const metersEl = document.getElementById("meters");
 
-    // Scare qualities, each built from MediaPipe face blendshapes (0-1).
-    // `max` is roughly how high that blendshape goes on a big scared face,
-    // so the meter fills up instead of hovering near the bottom.
+    // What makes up the scare score. `read(face)` returns a raw value, where
+    // `face` is { shapes, flinch } or null when no face is in view.
+    // `max` is roughly the raw value of a big scare, so the meter can fill up.
+    // `weight` is how much that meter counts toward the score.
     const QUALITIES = [
-      { label: "Mouth open", keys: ["jawOpen"], max: 0.6 },
-      { label: "Eyes wide", keys: ["eyeWideLeft", "eyeWideRight"], max: 0.5 },
-      { label: "Brows raised", keys: ["browInnerUp"], max: 0.7 },
-      { label: "Mouth stretch", keys: ["mouthStretchLeft", "mouthStretchRight"], max: 0.5 },
+      { label: "Scream", weight: 2, max: 0.3, read: () => micVolume() },
+      // Ignores slow head movement (under 0.5 face-widths/sec) so normal fidgeting doesn't count.
+      { label: "Flinch", weight: 1.5, max: 2.5, read: (face) => Math.max(0, (face?.flinch ?? 0) - 0.5) },
+      { label: "Mouth open", weight: 1, max: 0.6, read: (face) => face?.shapes.jawOpen ?? 0 },
+      { label: "Eyes wide", weight: 1, max: 0.5, read: (face) => face ? (face.shapes.eyeWideLeft + face.shapes.eyeWideRight) / 2 : 0 },
+      { label: "Brows raised", weight: 1, max: 0.7, read: (face) => face?.shapes.browInnerUp ?? 0 },
     ];
+    const TOTAL_WEIGHT = QUALITIES.reduce((sum, q) => sum + q.weight, 0);
 
     for (const q of QUALITIES) {
       const row = document.createElement("div");
@@ -170,6 +177,11 @@
     let rafId = null;
     let faceLandmarker = null;
     let lastVideoTime = -1;
+    let audioCtx = null;
+    let analyser = null;
+    let audioBuf = null;
+    let lastNose = null; // { x, y, t } for measuring head speed
+    let peak = 0;
 
     function setStatus(msg) {
       statusEl.textContent = msg;
@@ -190,6 +202,23 @@
         faceLandmarker = await FaceLandmarker.createFromOptions(fileset, options("CPU"));
       }
       if (!stream) setStatus("");
+    }
+
+    function setupMic(micStream) {
+      audioCtx = new AudioContext();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      audioBuf = new Float32Array(analyser.fftSize);
+      audioCtx.createMediaStreamSource(micStream).connect(analyser);
+    }
+
+    // Loudness of the mic right now (RMS, 0 = silent, ~0.3+ = screaming).
+    function micVolume() {
+      if (!analyser) return 0;
+      analyser.getFloatTimeDomainData(audioBuf);
+      let sum = 0;
+      for (const v of audioBuf) sum += v * v;
+      return Math.sqrt(sum / audioBuf.length);
     }
 
     async function listCameras() {
@@ -215,12 +244,19 @@
       stopCamera();
       try {
         const deviceId = cameraSelect.value;
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId
-            ? { deviceId: { exact: deviceId } }
-            : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-          audio: false,
-        });
+        const videoOpts = deviceId
+          ? { deviceId: { exact: deviceId } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" };
+        // Turn off the browser's voice processing so a scream reads as loud.
+        const audioOpts = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+        let micStatus = "";
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: videoOpts, audio: audioOpts });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ video: videoOpts, audio: false });
+          micStatus = "No mic access, so the Scream meter is off.";
+        }
+        if (stream.getAudioTracks().length) setupMic(stream);
         video.srcObject = stream;
         await video.play();
 
@@ -230,7 +266,7 @@
         await listCameras(); // labels are only available after permission is granted
         startBtn.disabled = true;
         stopBtn.disabled = false;
-        if (faceLandmarker) setStatus("");
+        if (faceLandmarker || micStatus) setStatus(micStatus);
         rafId = requestAnimationFrame(loop);
       } catch (err) {
         setStatus(`Couldn't start camera: ${err.name === "NotAllowedError" ? "permission denied" : err.message}`);
@@ -243,9 +279,13 @@
       stream?.getTracks().forEach((t) => t.stop());
       stream = null;
       video.srcObject = null;
+      audioCtx?.close();
+      audioCtx = null;
+      analyser = null;
       lastVideoTime = -1;
+      lastNose = null;
       ctx.clearRect(0, 0, overlay.width, overlay.height);
-      updateMeters(null);
+      resetMeters();
       startBtn.disabled = false;
       stopBtn.disabled = true;
     }
@@ -271,26 +311,64 @@
         }
       }
 
-      updateMeters(result.faceBlendshapes[0]);
+      updateMeters(readFace(result, now));
     }
 
-    // `blendshapes` is MediaPipe's { categories: [{ categoryName, score }] },
-    // or null when there's no face (meters fall back to 0).
-    function updateMeters(blendshapes) {
-      const scores = {};
-      for (const c of blendshapes?.categories ?? []) scores[c.categoryName] = c.score;
+    // Turns a MediaPipe result into { shapes, flinch }, or null if no face.
+    function readFace(result, now) {
+      const landmarks = result.faceLandmarks[0];
+      if (!landmarks) {
+        lastNose = null;
+        return null;
+      }
 
+      const shapes = {};
+      for (const c of result.faceBlendshapes[0].categories) shapes[c.categoryName] = c.score;
+
+      // Flinch = how fast the head moves, in face-widths per second, so it
+      // works the same whether you're close to or far from the camera.
+      // Landmark 1 is the nose tip; 234 and 454 are the sides of the face.
+      const px = (p) => ({ x: p.x * overlay.width, y: p.y * overlay.height });
+      const nose = px(landmarks[1]);
+      const left = px(landmarks[234]);
+      const right = px(landmarks[454]);
+      const faceWidth = Math.hypot(right.x - left.x, right.y - left.y);
+      let flinch = 0;
+      if (lastNose && now > lastNose.t) {
+        const moved = Math.hypot(nose.x - lastNose.x, nose.y - lastNose.y) / faceWidth;
+        flinch = moved / ((now - lastNose.t) / 1000);
+      }
+      lastNose = { ...nose, t: now };
+
+      return { shapes, flinch };
+    }
+
+    function updateMeters(face) {
       let total = 0;
       for (const q of QUALITIES) {
-        const raw = q.keys.reduce((sum, k) => sum + (scores[k] ?? 0), 0) / q.keys.length;
-        const target = Math.min(1, raw / q.max);
-        // Smooth so the bars don't jitter.
-        q.level = blendshapes ? q.level + (target - q.level) * 0.3 : 0;
+        const target = Math.min(1, q.read(face) / q.max);
+        // Jump up fast, fall back slowly, so a quick scream or flinch registers.
+        q.level += (target - q.level) * (target > q.level ? 0.5 : 0.08);
+        total += q.level * q.weight;
+      }
+      const score = Math.round((total / TOTAL_WEIGHT) * 100);
+      peak = Math.max(peak, score);
+      renderMeters(score);
+    }
+
+    function resetMeters() {
+      for (const q of QUALITIES) q.level = 0;
+      peak = 0;
+      renderMeters(0);
+    }
+
+    function renderMeters(score) {
+      for (const q of QUALITIES) {
         q.fill.style.width = `${q.level * 100}%`;
         q.valueEl.textContent = Math.round(q.level * 100);
-        total += q.level;
       }
-      scoreEl.textContent = Math.round((total / QUALITIES.length) * 100);
+      scoreEl.textContent = score;
+      peakEl.textContent = `peak ${peak}`;
     }
 
     function loop(now) {
